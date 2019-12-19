@@ -1,229 +1,148 @@
 #!/usr/bin/env python3
-import argparse
+"""
+A tool that allows for sorting and grouping images in different ways.
+"""
+import logging
 import os
 import sys
 import operator
+from concurrent import futures
+from shutil import copyfile
+
 import numpy as np
 import cv2
 from tqdm import tqdm
-from shutil import copyfile
-import json
-import re
 
-# DLIB is a GPU Memory hog, so the following modules should only be imported when required
-face_recognition = None
-FaceLandmarksExtractor = None
+# faceswap imports
+from lib.cli import FullHelpArgumentParser
+from lib.serializer import get_serializer_from_filename
+from lib.faces_detect import DetectedFace
+from lib.image import ImagesLoader, read_image
+from lib.vgg_face2_keras import VGGFace2 as VGGFace
+from plugins.extract.pipeline import Extractor, ExtractMedia
 
-def import_face_recognition():
-    ''' Import the face_recognition module only when it is required '''
-    global face_recognition
-    if face_recognition is None:
-        import face_recognition
+from . import cli
 
-def import_FaceLandmarksExtractor():
-    ''' Import the FaceLandmarksExtractor module only when it is required '''
-    global FaceLandmarksExtractor
-    if FaceLandmarksExtractor is None:
-        import lib.FaceLandmarksExtractor
-        FaceLandmarksExtractor = lib.FaceLandmarksExtractor
+logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
-if sys.version_info[0] < 3:
-    raise Exception("This program requires at least python3.2")
-if sys.version_info[0] == 3 and sys.version_info[1] < 2:
-    raise Exception("This program requires at least python3.2")
 
-class SortProcessor(object):
-    def __init__(self, subparser, command, description='default'):
-        self.arguments = None
+class Sort():
+    """ Sorts folders of faces based on input criteria """
+    # pylint: disable=no-member
+    def __init__(self, arguments):
+        self.args = arguments
         self.changes = None
-        self.parse_arguments(description, subparser, command)
+        self.serializer = None
+        self.vgg_face = None
+        # TODO set this as ImagesLoader in init. Need to move all processes to use it
+        self._loader = None
 
-    def parse_arguments(self, description, subparser, command):
-        parser = subparser.add_parser(
-                command,
-                help="This command lets you sort images using various methods."
-                     " Please backup your data and/or test this tool with a "
-                     "smaller data set to make sure you understand how it"
-                     "works.",
-                description=description,
-                epilog="Questions and feedback: \
-                        https://github.com/deepfakes/faceswap-playground"
-        )
-
-        parser.add_argument('-i', '--input',
-                            dest="input_dir",
-                            default="input_dir",
-                            help="Input directory of aligned faces.",
-                            required=True)
-
-        parser.add_argument('-o', '--output',
-                            dest="output_dir",
-                            default="__default",
-                            help="Output directory for sorted aligned faces.")
-
-        parser.add_argument('-f', '--final-process',
-                            type=str,
-                            choices=("folders", "rename"),
-                            dest='final_process',
-                            default="rename",
-                            help="'folders': files are sorted using the "
-                                 "-s/--sort-by method, then they are "
-                                 "organized into folders using the "
-                                 "-g/--group-by grouping method. "
-                                 "'rename': files are sorted using the "
-                                 "-s/--sort-by then they are renamed."
-                                 "Default: rename")
-
-        parser.add_argument('-t', '--ref_threshold',
-                            type=float,
-                            dest='min_threshold',
-                            default=-1.0,
-                            help="Float value. "
-                                 "Minimum threshold to use for grouping "
-                                 "comparison with 'face' and 'hist' methods. "
-                                 "The lower the value the more discriminating "
-                                 "the grouping is. "
-                                 "For face 0.6 should be enough, with 0.5 "
-                                 "being very discriminating. "
-                                 "For face-cnn 7.2 should be enough, with 4 "
-                                 "being very discriminating. "
-                                 "For hist 0.3 should be enough, with 0.2 "
-                                 "being very discriminating. "
-                                 "Be careful setting a value that's too "
-                                 "low in a directory with many images, as "
-                                 "this could result in a lot of directories "
-                                 " being created. "
-                                 "Defaults: face 0.6, face-cnn 7.2, hist 0.3")
-
-        parser.add_argument('-b', '--bins',
-                            type=int,
-                            dest='num_bins',
-                            default=5,
-                            help="Integer value. "
-                                 "Number of folders that will be used to " 
-                                 "group by blur. Folder 0 will be the least "
-                                 "blurry, while the last folder will be the "
-                                 "blurriest. If the number of images doesn't "
-                                 "divide evenly into the number of bins, the "
-                                 "remaining images get put in the last bin as "
-                                 "they will be the blurriest by definition. "
-                                 "Default value: 5")
-
-        parser.add_argument('-k', '--keep',
-                            action='store_true',
-                            dest='keep_original',
-                            default=False,
-                            help="Keeps the original files in the input "
-                                 "directory. Be careful when using this with "
-                                 "rename grouping and no specified output "
-                                 "directory as this would keep the original "
-                                 "and renamed files in the same directory.")
-
-        parser.add_argument('-l', '--log-changes',
-                            action='store_true',
-                            dest='log_changes',
-                            default=False,
-                            help="Logs file renaming changes if grouping by "
-                                 "renaming, or it logs the file "
-                                 "copying/movement if grouping by folders. "
-                                 "If no log file is specified with "
-                                 "'--log-file', then a 'sort_log.json' file "
-                                 "will be created in the input directory.")
-
-        parser.add_argument('-lf', '--log-file',
-                            dest='log_file',
-                            default='__default',
-                            help="Specify a log file to use for saving the "
-                                 "renaming or grouping information. "
-                                 "Default: sort_log.json")
-
-        parser.add_argument('-s', '--sort-by',
-                            type=str,
-                            choices=("blur", "face", "face-cnn",
-                                     "face-cnn-dissim", "face-dissim", "face-yaw", "hist",
-                                     "hist-dissim"),
-                            dest='sort_method',
-                            default="hist",
-                            help="Sort by method. "
-                                 "Choose how images are sorted. "
-                                 "Default: hist")
-
-        parser.add_argument('-g', '--group-by',
-                            type=str,
-                            choices=("blur", "face", "face-cnn", "hist"),
-                            dest='group_method',
-                            default="__default",
-                            help="Group by method. "
-                                 "When -fp/--final-processing by folders "
-                                 "choose the how the images are grouped after "
-                                 "sorting. "
-                                 "Default: non-dissim version of "
-                                 "-s/--sort-by method")
-
-        parser = self.add_optional_arguments(parser)
-        parser.set_defaults(func=self.process_arguments)
-
-    def add_optional_arguments(self, parser):
-        # Override this for custom arguments
-        return parser
-
-    def process_arguments(self, arguments):
-        self.arguments = arguments
+    def process(self):
+        """ Main processing function of the sort tool """
 
         # Setting default argument values that cannot be set by argparse
 
         # Set output dir to the same value as input dir
         # if the user didn't specify it.
-        if self.arguments.output_dir.lower() == "__default":
-            self.arguments.output_dir = self.arguments.input_dir
-
-        # Set final_process to group if folders was chosen
-        if self.arguments.final_process.lower() == "folders":
-            self.arguments.final_process = "group"
-
-        # Assign default group_method if not set by user
-        if self.arguments.group_method == '__default':
-            self.arguments.group_method = self.arguments.sort_method.replace('-dissim', '')
+        if self.args.output_dir is None:
+            logger.verbose("No output directory provided. Using input dir as output dir.")
+            self.args.output_dir = self.args.input_dir
 
         # Assigning default threshold values based on grouping method
-        if self.arguments.min_threshold == -1.0 and self.arguments.final_process == "group":
-            method = self.arguments.group_method.lower()
-            if method == 'face':
-                self.arguments.min_threshold = 0.6
-            elif method == 'face-cnn':
-                self.arguments.min_threshold = 7.2
+        if (self.args.final_process == "folders"
+                and self.args.min_threshold < 0.0):
+            method = self.args.group_method.lower()
+            if method == 'face-cnn':
+                self.args.min_threshold = 7.2
             elif method == 'hist':
-                self.arguments.min_threshold = 0.3
+                self.args.min_threshold = 0.3
+
+        # Load VGG Face if sorting by face
+        if self.args.sort_method.lower() == "face":
+            self.vgg_face = VGGFace(backend=self.args.backend, loglevel=self.args.loglevel)
 
         # If logging is enabled, prepare container
-        if self.arguments.log_changes:
+        if self.args.log_changes:
             self.changes = dict()
 
-        # Assign default sort_log.json value if user didn't specify one
-        if self.arguments.log_file.lower() == '__default':
-            self.arguments.log_file = os.path.join(self.arguments.input_dir, 'sort_log.json')
+            # Assign default sort_log.json value if user didn't specify one
+            if self.args.log_file_path == 'sort_log.json':
+                self.args.log_file_path = os.path.join(self.args.input_dir,
+                                                       'sort_log.json')
 
-        self.process()
+            # Set serializer based on logfile extension
+            self.serializer = get_serializer_from_filename(self.args.log_file_path)
 
-    def process(self):
+        # Prepare sort, group and final process method names
+        _sort = "sort_" + self.args.sort_method.lower()
+        _group = "group_" + self.args.group_method.lower()
+        _final = "final_process_" + self.args.final_process.lower()
+        if _sort.startswith('sort_color-'):
+            self.args.color_method = _sort.replace('sort_color-', '')
+            _sort = _sort[:10]
+        self.args.sort_method = _sort.replace('-', '_')
+        self.args.group_method = _group.replace('-', '_')
+        self.args.final_process = _final.replace('-', '_')
+
+        self.sort_process()
+
+    @staticmethod
+    def launch_aligner():
+        """ Load the aligner plugin to retrieve landmarks """
+        extractor = Extractor(None, "fan", None, normalize_method="hist")
+        extractor.set_batchsize("align", 1)
+        extractor.launch()
+        return extractor
+
+    @staticmethod
+    def alignment_dict(filename, image):
+        """ Set the image to an ExtractMedia object for alignment """
+        height, width = image.shape[:2]
+        face = DetectedFace(x=0, w=width, y=0, h=height)
+        return ExtractMedia(filename, image, detected_faces=[face])
+
+    def _get_landmarks(self):
+        """ Multi-threaded, parallel and sequentially ordered landmark loader """
+        extractor = self.launch_aligner()
+        filename_list, image_list = self._get_images()
+        feed_list = list(map(Sort.alignment_dict, filename_list, image_list))
+        landmarks = np.zeros((len(feed_list), 68, 2), dtype='float32')
+
+        logger.info("Finding landmarks in images...")
+        # TODO thread the put to queue so we don't have to put and get at the same time
+        # Or even better, set up a proper background loader from disk (i.e. use lib.image.ImageIO)
+        for idx, feed in enumerate(tqdm(feed_list, desc="Aligning...", file=sys.stdout)):
+            extractor.input_queue.put(feed)
+            landmarks[idx] = next(extractor.detected_faces()).detected_faces[0].landmarks_xy
+
+        return filename_list, image_list, landmarks
+
+    def _get_images(self):
+        """ Multi-threaded, parallel and sequentially ordered image loader """
+        logger.info("Loading images...")
+        filename_list = self.find_images(self.args.input_dir)
+        with futures.ThreadPoolExecutor() as executor:
+            image_list = list(tqdm(executor.map(read_image, filename_list),
+                                   desc="Loading Images...",
+                                   file=sys.stdout,
+                                   total=len(filename_list)))
+
+        return filename_list, image_list
+
+    def sort_process(self):
         """
         This method dynamically assigns the functions that will be used to run
         the core process of sorting, optionally grouping, renaming/moving into
         folders. After the functions are assigned they are executed.
         """
-        __sort_method = self.arguments.sort_method.lower()
-        __group_method = self.arguments.group_method.lower()
-        final_process = self.arguments.final_process.lower()
-
-        # Assign the methods that will be used for processing the files
-        sort_method = self.set_process_method("sort", __sort_method)
-        group_method = self.set_process_method("group", __group_method)
-        final_method = self.set_process_method("final_process", final_process)
+        sort_method = self.args.sort_method.lower()
+        group_method = self.args.group_method.lower()
+        final_method = self.args.final_process.lower()
 
         img_list = getattr(self, sort_method)()
-        if "group" in final_process:
+        if "folders" in final_method:
             # Check if non-dissim sort method and group method are not the same
-            if __sort_method.replace('-dissim', '') != __group_method:
+            if group_method.replace('group_', '') not in sort_method:
                 img_list = self.reload_images(group_method, img_list)
                 img_list = getattr(self, group_method)(img_list)
             else:
@@ -231,217 +150,191 @@ class SortProcessor(object):
 
         getattr(self, final_method)(img_list)
 
-        print ("Done.")
+        logger.info("Done.")
 
     # Methods for sorting
     def sort_blur(self):
-        input_dir = self.arguments.input_dir
+        """ Sort by blur amount """
+        logger.info("Sorting by estimated image blur...")
+        filename_list, image_list = self._get_images()
 
-        print ("Sorting by blur...")
-        img_list = [ [x, self.estimate_blur(cv2.imread(x))] for x in tqdm(self.find_images(input_dir), desc="Loading", file=sys.stdout) ]
-        print ("Sorting...")
+        logger.info("Estimating blur...")
+        blurs = [self.estimate_blur(img) for img in image_list]
 
-        img_list = sorted(img_list, key=operator.itemgetter(1), reverse=True)
-
+        logger.info("Sorting...")
+        matched_list = list(zip(filename_list, blurs))
+        img_list = sorted(matched_list, key=operator.itemgetter(1), reverse=True)
         return img_list
 
     def sort_face(self):
-        import_face_recognition()
-       
-        input_dir = self.arguments.input_dir
+        """ Sort by identity similarity """
+        logger.info("Sorting by identity similarity...")
 
-        print ("Sorting by face similarity...")
-        
-        img_list = [ [x, face_recognition.face_encodings(cv2.imread(x)) ] for x in tqdm( self.find_images(input_dir), desc="Loading", file=sys.stdout) ]
+        # TODO This should be set in init
+        self._loader = ImagesLoader(self.args.input_dir)
 
-        img_list_len = len(img_list)
-        for i in tqdm ( range(0, img_list_len-1), desc="Sorting", file=sys.stdout):
-            min_score = float("inf")
-            j_min_score = i+1
-            for j in range(i+1,len(img_list)):
-            
-                f1encs = img_list[i][1]
-                f2encs = img_list[j][1]
-                if f1encs is not None and f2encs is not None and len(f1encs) > 0 and len(f2encs) > 0:
-                    score = face_recognition.face_distance(f1encs[0], f2encs)[0]
-                else: 
-                    score = float("inf")
-                
-                if score < min_score:
-                    min_score = score
-                    j_min_score = j            
-            img_list[i+1], img_list[j_min_score] = img_list[j_min_score], img_list[i+1]
-            
-        return img_list
+        filenames = []
+        preds = np.empty((self._loader.count, 512), dtype="float32")
+        for idx, (filename, image) in enumerate(tqdm(self._loader.load(),
+                                                     desc="Classifying Faces...",
+                                                     total=self._loader.count)):
+            filenames.append(filename)
+            preds[idx] = self.vgg_face.predict(image)
 
-    def sort_face_dissim(self):
-        import_face_recognition()
-        
-        input_dir = self.arguments.input_dir
+        logger.info("Sorting by ward linkage...")
 
-        print ("Sorting by face dissimilarity...")
-
-        img_list = [ [x, face_recognition.face_encodings(cv2.imread(x)), 0 ] for x in tqdm( self.find_images(input_dir), desc="Loading", file=sys.stdout) ]
-
-        img_list_len = len(img_list)
-        for i in tqdm ( range(0, img_list_len), desc="Sorting", file=sys.stdout):
-            score_total = 0
-            for j in range( 0, img_list_len):
-                if i == j:
-                    continue
-                try:
-                    score_total += face_recognition.face_distance([img_list[i][1]], [img_list[j][1]])
-                except:
-                    pass
-
-            img_list[i][2] = score_total
-
-
-        print ("Sorting...")
-        img_list = sorted(img_list, key=operator.itemgetter(2), reverse=True)
+        indices = self.vgg_face.sorted_similarity(preds, method="ward")
+        img_list = np.array(filenames)[indices]
         return img_list
 
     def sort_face_cnn(self):
-        import_FaceLandmarksExtractor()
+        """ Sort by landmark similarity """
+        logger.info("Sorting by landmark similarity...")
+        filename_list, _, landmarks = self._get_landmarks()
+        img_list = list(zip(filename_list, landmarks))
 
-        input_dir = self.arguments.input_dir
-
-        print ("Sorting by face-cnn similarity...")
-
-        img_list = []
-        for x in tqdm( self.find_images(input_dir), desc="Loading", file=sys.stdout):
-            d = FaceLandmarksExtractor.extract(cv2.imread(x), 'cnn', True, input_is_predetected_face=True)
-            img_list.append( [x, np.array(d[0][1]) if len(d) > 0 else np.zeros ( (68,2) ) ] )
-
+        logger.info("Comparing landmarks and sorting...")
         img_list_len = len(img_list)
-        for i in tqdm ( range(0, img_list_len-1), desc="Sorting", file=sys.stdout):
+        for i in tqdm(range(0, img_list_len - 1), desc="Comparing...", file=sys.stdout):
             min_score = float("inf")
-            j_min_score = i+1
-            for j in range(i+1,len(img_list)):
-
+            j_min_score = i + 1
+            for j in range(i + 1, img_list_len):
                 fl1 = img_list[i][1]
                 fl2 = img_list[j][1]
-                score = np.sum ( np.absolute ( (fl2 - fl1).flatten() ) )
-
+                score = np.sum(np.absolute((fl2 - fl1).flatten()))
                 if score < min_score:
                     min_score = score
                     j_min_score = j
-            img_list[i+1], img_list[j_min_score] = img_list[j_min_score], img_list[i+1]
-
+            (img_list[i + 1], img_list[j_min_score]) = (img_list[j_min_score], img_list[i + 1])
         return img_list
 
     def sort_face_cnn_dissim(self):
-        import_FaceLandmarksExtractor()
+        """ Sort by landmark dissimilarity """
+        logger.info("Sorting by landmark dissimilarity...")
+        filename_list, _, landmarks = self._get_landmarks()
+        scores = np.zeros(len(filename_list), dtype='float32')
+        img_list = list(list(items) for items in zip(filename_list, landmarks, scores))
 
-        input_dir = self.arguments.input_dir
-
-        print ("Sorting by face-cnn dissimilarity...")
-
-        img_list = []
-        for x in tqdm( self.find_images(input_dir), desc="Loading", file=sys.stdout):
-            d = FaceLandmarksExtractor.extract(cv2.imread(x), 'cnn', True, input_is_predetected_face=True)
-            img_list.append( [x, np.array(d[0][1]) if len(d) > 0 else np.zeros ( (68,2) ), 0 ] )
-
+        logger.info("Comparing landmarks...")
         img_list_len = len(img_list)
-        for i in tqdm( range(0, img_list_len-1), desc="Sorting", file=sys.stdout):
+        for i in tqdm(range(0, img_list_len - 1), desc="Comparing...", file=sys.stdout):
             score_total = 0
-            for j in range(i+1,len(img_list)):
+            for j in range(i + 1, img_list_len):
                 if i == j:
                     continue
                 fl1 = img_list[i][1]
                 fl2 = img_list[j][1]
-                score_total += np.sum ( np.absolute ( (fl2 - fl1).flatten() ) )
-
+                score_total += np.sum(np.absolute((fl2 - fl1).flatten()))
             img_list[i][2] = score_total
 
-        print ("Sorting...")
+        logger.info("Sorting...")
         img_list = sorted(img_list, key=operator.itemgetter(2), reverse=True)
-
         return img_list
-        
+
     def sort_face_yaw(self):
-        def calc_landmarks_face_pitch(fl): #unused
-            t = ( (fl[6][1]-fl[8][1]) + (fl[10][1]-fl[8][1]) ) / 2.0   
-            b = fl[8][1]
-            return b-t
-        def calc_landmarks_face_yaw(fl):
-            l = ( (fl[27][0]-fl[0][0]) + (fl[28][0]-fl[1][0]) + (fl[29][0]-fl[2][0]) ) / 3.0   
-            r = ( (fl[16][0]-fl[27][0]) + (fl[15][0]-fl[28][0]) + (fl[14][0]-fl[29][0]) ) / 3.0
-            return r-l
-            
-        import_FaceLandmarksExtractor()
-        input_dir = self.arguments.input_dir
-    
-        img_list = []
-        for x in tqdm( self.find_images(input_dir), desc="Loading", file=sys.stdout):
-            d = FaceLandmarksExtractor.extract(cv2.imread(x), 'cnn', True, input_is_predetected_face=True)
-            img_list.append( [x, calc_landmarks_face_yaw(np.array(d[0][1])) ] )
+        """ Sort by estimated face yaw angle """
+        logger.info("Sorting by estimated face yaw angle..")
+        filename_list, _, landmarks = self._get_landmarks()
 
-        print ("Sorting...")
-        img_list = sorted(img_list, key=operator.itemgetter(1), reverse=True)
-        
+        logger.info("Estimating yaw...")
+        yaws = [self.calc_landmarks_face_yaw(mark) for mark in landmarks]
+
+        logger.info("Sorting...")
+        matched_list = list(zip(filename_list, yaws))
+        img_list = sorted(matched_list, key=operator.itemgetter(1), reverse=True)
         return img_list
-        
+
     def sort_hist(self):
-        input_dir = self.arguments.input_dir
+        """ Sort by image histogram similarity """
+        logger.info("Sorting by histogram similarity...")
+        filename_list, image_list = self._get_images()
+        distance = cv2.HISTCMP_BHATTACHARYYA
 
-        print ("Sorting by histogram similarity...")
+        logger.info("Calculating histograms...")
+        histograms = [cv2.calcHist([img], [0], None, [256], [0, 256]) for img in image_list]
+        img_list = list(zip(filename_list, histograms))
 
-        img_list = [ [x, cv2.calcHist([cv2.imread(x)], [0], None, [256], [0, 256]) ] for x in tqdm( self.find_images(input_dir), desc="Loading", file=sys.stdout) ]
-
+        logger.info("Comparing histograms and sorting...")
         img_list_len = len(img_list)
-        for i in tqdm( range(0, img_list_len-1), desc="Sorting", file=sys.stdout):
+        for i in tqdm(range(0, img_list_len - 1), desc="Comparing", file=sys.stdout):
             min_score = float("inf")
-            j_min_score = i+1
-            for j in range(i+1,len(img_list)):
-                score = cv2.compareHist(img_list[i][1], img_list[j][1], cv2.HISTCMP_BHATTACHARYYA)
+            j_min_score = i + 1
+            for j in range(i + 1, img_list_len):
+                score = cv2.compareHist(img_list[i][1], img_list[j][1], distance)
                 if score < min_score:
                     min_score = score
                     j_min_score = j
-            img_list[i+1], img_list[j_min_score] = img_list[j_min_score], img_list[i+1]
-
+            (img_list[i + 1], img_list[j_min_score]) = (img_list[j_min_score], img_list[i + 1])
         return img_list
 
     def sort_hist_dissim(self):
-        input_dir = self.arguments.input_dir
+        """ Sort by image histogram dissimilarity """
+        logger.info("Sorting by histogram dissimilarity...")
+        filename_list, image_list = self._get_images()
+        scores = np.zeros(len(filename_list), dtype='float32')
+        distance = cv2.HISTCMP_BHATTACHARYYA
 
-        print ("Sorting by histogram dissimilarity...")
+        logger.info("Calculating histograms...")
+        histograms = [cv2.calcHist([img], [0], None, [256], [0, 256]) for img in image_list]
+        img_list = list(list(items) for items in zip(filename_list, histograms, scores))
 
-        img_list = [ [x, cv2.calcHist([cv2.imread(x)], [0], None, [256], [0, 256]), 0] for x in tqdm( self.find_images(input_dir), desc="Loading", file=sys.stdout) ]
-
+        logger.info("Comparing histograms...")
         img_list_len = len(img_list)
-        for i in tqdm ( range(0, img_list_len), desc="Sorting", file=sys.stdout):
+        for i in tqdm(range(0, img_list_len), desc="Comparing", file=sys.stdout):
             score_total = 0
-            for j in range( 0, img_list_len):
+            for j in range(0, img_list_len):
                 if i == j:
                     continue
-                score_total += cv2.compareHist(img_list[i][1], img_list[j][1], cv2.HISTCMP_BHATTACHARYYA)
-
+                score_total += cv2.compareHist(img_list[i][1], img_list[j][1], distance)
             img_list[i][2] = score_total
 
-
-        print ("Sorting...")
+        logger.info("Sorting...")
         img_list = sorted(img_list, key=operator.itemgetter(2), reverse=True)
-
         return img_list
+
+    def sort_color(self):
+        """ Score by channel average intensity """
+        logger.info("Sorting by channel average intensity...")
+        desired_channel = {'gray': 0, 'luma': 0, 'orange': 1, 'green': 2}
+        method = self.args.color_method
+        channel_to_sort = next(v for (k, v) in desired_channel.items() if method.endswith(k))
+        filename_list, image_list = self._get_images()
+
+        logger.info("Converting to appropriate colorspace...")
+        same_size = all(img.size == image_list[0].size for img in image_list)
+        images = np.array(image_list, dtype='float32')[None, ...] if same_size else image_list
+        converted_images = self._convert_color(images, same_size, method)
+
+        logger.info("Scoring each image...")
+        if same_size:
+            scores = np.average(converted_images[0], axis=(1, 2))
+        else:
+            progress_bar = tqdm(converted_images, desc="Scoring", file=sys.stdout)
+            scores = np.array([np.average(image, axis=(0, 1)) for image in progress_bar])
+
+        logger.info("Sorting...")
+        matched_list = list(zip(filename_list, scores[:, channel_to_sort]))
+        sorted_file_img_list = sorted(matched_list, key=operator.itemgetter(1), reverse=True)
+        return sorted_file_img_list
 
     # Methods for grouping
     def group_blur(self, img_list):
+        """ Group into bins by blur """
         # Starting the binning process
-        num_bins = self.arguments.num_bins
+        num_bins = self.args.num_bins
 
         # The last bin will get all extra images if it's
         # not possible to distribute them evenly
         num_per_bin = len(img_list) // num_bins
         remainder = len(img_list) % num_bins
 
-        print ("Grouping by blur...")
-        bins = [ [] for _ in range(num_bins) ]
-        image_index = 0
+        logger.info("Grouping by blur...")
+        bins = [[] for _ in range(num_bins)]
+        idx = 0
         for i in range(num_bins):
-            for j in range(num_per_bin):
-                bins[i].append(img_list[image_index][0])
-                image_index += 1
+            for _ in range(num_per_bin):
+                bins[i].append(img_list[idx][0])
+                idx += 1
 
         # If remainder is 0, nothing gets added to the last bin.
         for i in range(1, remainder + 1):
@@ -449,59 +342,9 @@ class SortProcessor(object):
 
         return bins
 
-    def group_face(self, img_list):
-        print ("Grouping by face similarity...")
-
-        # Groups are of the form: group_num -> reference face
-        reference_groups = dict()
-
-        # Bins array, where index is the group number and value is
-        # an array containing the file paths to the images in that group.
-        # The first group (0), is always the non-face group.
-        bins = [[]]
-
-        # Comparison threshold used to decide how similar
-        # faces have to be to be grouped together.
-        min_threshold = self.arguments.min_threshold
-
-        img_list_len = len(img_list)
-
-        for i in tqdm(range(1, img_list_len), desc="Grouping", file=sys.stdout):
-            f1encs = img_list[i][1]
-
-            # Check if current image is a face, if not then
-            # add it immediately to the non-face list.
-            if f1encs is None or len(f1encs) <= 0:
-                bins[0].append(img_list[i][0])
-
-            else:
-                current_best = [-1, float("inf")]
-
-                for key, references in reference_groups.items():
-                    # Non-faces are not added to reference_groups dict, thus
-                    # removing the need to check that f2encs is a face.
-                    # The try-catch block is to handle the first face that gets
-                    # processed, as the first value is None.
-                    try:
-                        score = self.get_avg_score_faces(f1encs, references)
-                    except TypeError:
-                        score = float("inf")
-                    except ZeroDivisionError:
-                        score = float("inf")
-                    if score < current_best[1]:
-                        current_best[0], current_best[1] = key, score
-
-                if current_best[1] < min_threshold:
-                    reference_groups[current_best[0]].append(f1encs[0])
-                    bins[current_best[0]].append(img_list[i][0])
-                else:
-                    reference_groups[len(reference_groups)] = img_list[i][1]
-                    bins.append([img_list[i][0]])
-
-        return bins
-
     def group_face_cnn(self, img_list):
-        print ("Grouping by face-cnn similarity...")
+        """ Group into bins by CNN face similarity """
+        logger.info("Grouping by face-cnn similarity...")
 
         # Groups are of the form: group_num -> reference faces
         reference_groups = dict()
@@ -514,11 +357,13 @@ class SortProcessor(object):
         # faces have to be to be grouped together.
         # It is multiplied by 1000 here to allow the cli option to use smaller
         # numbers.
-        min_threshold = self.arguments.min_threshold * 1000
+        min_threshold = self.args.min_threshold * 1000
 
         img_list_len = len(img_list)
 
-        for i in tqdm ( range(0, img_list_len - 1), desc="Grouping", file=sys.stdout):
+        for i in tqdm(range(0, img_list_len - 1),
+                      desc="Grouping",
+                      file=sys.stdout):
             fl1 = img_list[i][1]
 
             current_best = [-1, float("inf")]
@@ -542,8 +387,33 @@ class SortProcessor(object):
 
         return bins
 
+    def group_face_yaw(self, img_list):
+        """ Group into bins by yaw of face """
+        # Starting the binning process
+        num_bins = self.args.num_bins
+
+        # The last bin will get all extra images if it's
+        # not possible to distribute them evenly
+        num_per_bin = len(img_list) // num_bins
+        remainder = len(img_list) % num_bins
+
+        logger.info("Grouping by face-yaw...")
+        bins = [[] for _ in range(num_bins)]
+        idx = 0
+        for i in range(num_bins):
+            for _ in range(num_per_bin):
+                bins[i].append(img_list[idx][0])
+                idx += 1
+
+        # If remainder is 0, nothing gets added to the last bin.
+        for i in range(1, remainder + 1):
+            bins[-1].append(img_list[-i][0])
+
+        return bins
+
     def group_hist(self, img_list):
-        print ("Grouping by histogram...")
+        """ Group into bins by histogram """
+        logger.info("Grouping by histogram...")
 
         # Groups are of the form: group_num -> reference histogram
         reference_groups = dict()
@@ -552,13 +422,15 @@ class SortProcessor(object):
         # an array containing the file paths to the images in that group
         bins = []
 
-        min_threshold = self.arguments.min_threshold
+        min_threshold = self.args.min_threshold
 
         img_list_len = len(img_list)
         reference_groups[0] = [img_list[0][1]]
         bins.append([img_list[0][0]])
 
-        for i in tqdm(range(1, img_list_len), desc="Grouping", file=sys.stdout):
+        for i in tqdm(range(1, img_list_len),
+                      desc="Grouping",
+                      file=sys.stdout):
             current_best = [-1, float("inf")]
             for key, value in reference_groups.items():
                 score = self.get_avg_score_hist(img_list[i][1], value)
@@ -576,72 +448,93 @@ class SortProcessor(object):
 
     # Final process methods
     def final_process_rename(self, img_list):
-        output_dir = self.arguments.output_dir
+        """ Rename the files """
+        output_dir = self.args.output_dir
 
-        process_file = self.set_process_file_method(self.arguments.log_changes, self.arguments.keep_original)
+        process_file = self.set_process_file_method(self.args.log_changes,
+                                                    self.args.keep_original)
 
         # Make sure output directory exists
-        if not os.path.exists (output_dir):
-            os.makedirs (output_dir)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
 
-        description = ("Copying and Renaming" if self.arguments.keep_original else "Moving and Renaming")
+        description = (
+            "Copying and Renaming" if self.args.keep_original
+            else "Moving and Renaming"
+        )
 
-        for i in tqdm(range(0, len(img_list)), desc=description, leave=False, file=sys.stdout):
-            src = img_list[i][0]
+        for i in tqdm(range(0, len(img_list)),
+                      desc=description,
+                      leave=False,
+                      file=sys.stdout):
+            src = img_list[i] if isinstance(img_list[i], str) else img_list[i][0]
             src_basename = os.path.basename(src)
 
-            dst = os.path.join (output_dir, '%.5d_%s' % (i, src_basename ) )
+            dst = os.path.join(output_dir, '{:05d}_{}'.format(i, src_basename))
             try:
-                process_file (src, dst, self.changes)
-            except FileNotFoundError as e:
-                print(e)
-                print ('fail to rename %s' % (src) )
+                process_file(src, dst, self.changes)
+            except FileNotFoundError as err:
+                logger.error(err)
+                logger.error('fail to rename %s', src)
 
-        for i in tqdm( range(0,len(img_list)) , desc=description, file=sys.stdout):
-            renaming = self.set_renaming_method(self.arguments.log_changes)
-            src, dst = renaming(img_list[i][0], output_dir, i, self.changes)
+        for i in tqdm(range(0, len(img_list)),
+                      desc=description,
+                      file=sys.stdout):
+            renaming = self.set_renaming_method(self.args.log_changes)
+            fname = img_list[i] if isinstance(img_list[i], str) else img_list[i][0]
+            src, dst = renaming(fname, output_dir, i, self.changes)
 
             try:
-                os.rename (src, dst)
-            except FileNotFoundError as e:
-                print(e)
-                print ('fail to rename %s' % (src) )
+                os.rename(src, dst)
+            except FileNotFoundError as err:
+                logger.error(err)
+                logger.error('fail to rename %s', format(src))
 
-        if self.arguments.log_changes:
-            self.write_to_log(self.arguments.log_file, self.changes)
+        if self.args.log_changes:
+            self.write_to_log(self.changes)
 
-    def final_process_group(self, bins):
-        output_dir = self.arguments.output_dir
+    def final_process_folders(self, bins):
+        """ Move the files to folders """
+        output_dir = self.args.output_dir
 
-        process_file = self.set_process_file_method(self.arguments.log_changes, self.arguments.keep_original)
+        process_file = self.set_process_file_method(self.args.log_changes,
+                                                    self.args.keep_original)
 
         # First create new directories to avoid checking
         # for directory existence in the moving loop
-        print ("Creating group directories.")
+        logger.info("Creating group directories.")
         for i in range(len(bins)):
-            directory = os.path.join (output_dir, str(i))
-            if not os.path.exists (directory):
-                os.makedirs (directory)
+            directory = os.path.join(output_dir, str(i))
+            if not os.path.exists(directory):
+                os.makedirs(directory)
 
-        description = ("Copying into Groups" if self.arguments.keep_original else "Moving into Groups")
+        description = (
+            "Copying into Groups" if self.args.keep_original
+            else "Moving into Groups"
+        )
 
-        print ("Total groups found: {}".format(len(bins)))
+        logger.info("Total groups found: %s", len(bins))
         for i in tqdm(range(len(bins)), desc=description, file=sys.stdout):
             for j in range(len(bins[i])):
                 src = bins[i][j]
-                src_basename = os.path.basename (src)
+                src_basename = os.path.basename(src)
 
-                dst = os.path.join (output_dir, str(i), src_basename)
+                dst = os.path.join(output_dir, str(i), src_basename)
                 try:
-                    process_file (src, dst, self.changes)
-                except FileNotFoundError as e:
-                    print (e)
-                    print ('Failed to move {0} to {1}'.format(src, dst))
+                    process_file(src, dst, self.changes)
+                except FileNotFoundError as err:
+                    logger.error(err)
+                    logger.error("Failed to move '%s' to '%s'", src, dst)
 
-        if self.arguments.log_changes:
-            self.write_to_log(self.arguments.log_file, self.changes)
+        if self.args.log_changes:
+            self.write_to_log(self.changes)
 
     # Various helper methods
+    def write_to_log(self, changes):
+        """ Write the changes to log file """
+        logger.info("Writing sort log to: '%s'", self.args.log_file_path)
+        self.serializer.save(self.args.log_file_path, changes)
+
     def reload_images(self, group_method, img_list):
         """
         Reloads the image list by replacing the comparative values with those
@@ -652,26 +545,47 @@ class SortProcessor(object):
         :return: img_list but with the comparative values that the chosen
         grouping method expects.
         """
-        import_face_recognition()
-
-        input_dir = self.arguments.input_dir
-        print("Preparing to group...")
+        logger.info("Preparing to group...")
         if group_method == 'group_blur':
-            temp_list = [[x, self.estimate_blur(cv2.imread(x))] for x in tqdm(self.find_images(input_dir), desc="Reloading", file=sys.stdout)]
-        elif group_method == 'group_face':
-            temp_list = [[x, face_recognition.face_encodings(cv2.imread(x))] for x in tqdm(self.find_images(input_dir), desc="Reloading", file=sys.stdout)]
+            filename_list, image_list = self._get_images()
+            blurs = [self.estimate_blur(img) for img in image_list]
+            temp_list = list(zip(filename_list, blurs))
         elif group_method == 'group_face_cnn':
-            import_FaceLandmarksExtractor()
-            temp_list = []
-            for x in tqdm(self.find_images(input_dir), desc="Reloading", file=sys.stdout):
-                d = FaceLandmarksExtractor.extract(cv2.imread(x), 'cnn', True, input_is_predetected_face=True)
-                temp_list.append([x, np.array(d[0][1]) if len(d) > 0 else np.zeros((68, 2))])
+            filename_list, image_list, landmarks = self._get_landmarks()
+            temp_list = list(zip(filename_list, landmarks))
+        elif group_method == 'group_face_yaw':
+            filename_list, image_list, landmarks = self._get_landmarks()
+            yaws = [self.calc_landmarks_face_yaw(mark) for mark in landmarks]
+            temp_list = list(zip(filename_list, yaws))
         elif group_method == 'group_hist':
-            temp_list = [[x, cv2.calcHist([cv2.imread(x)], [0], None, [256], [0, 256])] for x in tqdm(self.find_images(input_dir), desc="Reloading", file=sys.stdout)]
+            filename_list, image_list = self._get_images()
+            histograms = [cv2.calcHist([img], [0], None, [256], [0, 256]) for img in image_list]
+            temp_list = list(zip(filename_list, histograms))
         else:
             raise ValueError("{} group_method not found.".format(group_method))
 
         return self.splice_lists(img_list, temp_list)
+
+    @staticmethod
+    def _convert_color(imgs, same_size, method):
+        """ Helper function to convert colorspaces """
+
+        if method.endswith('gray'):
+            conversion = np.array([[0.0722], [0.7152], [0.2126]])
+        else:
+            conversion = np.array([[0.25, 0.5, 0.25], [-0.5, 0.0, 0.5], [-0.25, 0.5, -0.25]])
+
+        if same_size:
+            path = 'greedy'
+            operation = 'bijk, kl -> bijl' if method.endswith('gray') else 'bijl, kl -> bijk'
+        else:
+            operation = 'ijk, kl -> ijl' if method.endswith('gray') else 'ijl, kl -> ijk'
+            path = np.einsum_path(operation, imgs[0][..., :3], conversion, optimize='optimal')[0]
+
+        progress_bar = tqdm(imgs, desc="Converting", file=sys.stdout)
+        images = [np.einsum(operation, img[..., :3], conversion, optimize=path).astype('float32')
+                  for img in progress_bar]
+        return images
 
     @staticmethod
     def splice_lists(sorted_list, new_vals_list):
@@ -693,35 +607,53 @@ class SortProcessor(object):
         # Make new list of just image paths to serve as an index
         val_index_list = [i[0] for i in new_vals_list]
         for i in tqdm(range(len(sorted_list)), desc="Splicing", file=sys.stdout):
-            current_image = sorted_list[i][0]
-            new_val_index = val_index_list.index(current_image)
-            new_list.append([current_image, new_vals_list[new_val_index][1]])
+            current_img = sorted_list[i] if isinstance(sorted_list[i], str) else sorted_list[i][0]
+            new_val_index = val_index_list.index(current_img)
+            new_list.append([current_img, new_vals_list[new_val_index][1]])
 
         return new_list
 
     @staticmethod
     def find_images(input_dir):
+        """ Return list of images at specified location """
         result = []
         extensions = [".jpg", ".png", ".jpeg"]
-        for root, dirs, files in os.walk(input_dir):
+        for root, _, files in os.walk(input_dir):
             for file in files:
                 if os.path.splitext(file)[1].lower() in extensions:
-                    result.append (os.path.join(root, file))
+                    result.append(os.path.join(root, file))
+            break
         return result
 
     @staticmethod
     def estimate_blur(image):
+        """
+        Estimate the amount of blur an image has with the variance of the Laplacian.
+        Normalize by pixel number to offset the effect of image size on pixel gradients & variance
+        """
         if image.ndim == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        blur_map = cv2.Laplacian(image, cv2.CV_64F)
-        score = np.var(blur_map)
+        blur_map = cv2.Laplacian(image, cv2.CV_32F)
+        score = np.var(blur_map) / np.sqrt(image.shape[0] * image.shape[1])
         return score
 
     @staticmethod
-    def set_process_method(prefix, method):
-        _method = re.sub(r'-', r'_', method)
-        return prefix + "_" + _method
+    def calc_landmarks_face_pitch(flm):
+        """ UNUSED - Calculate the amount of pitch in a face """
+        var_t = ((flm[6][1] - flm[8][1]) + (flm[10][1] - flm[8][1])) / 2.0
+        var_b = flm[8][1]
+        return var_b - var_t
+
+    @staticmethod
+    def calc_landmarks_face_yaw(flm):
+        """ Calculate the amount of yaw in a face """
+        var_l = ((flm[27][0] - flm[0][0])
+                 + (flm[28][0] - flm[1][0])
+                 + (flm[29][0] - flm[2][0])) / 3.0
+        var_r = ((flm[16][0] - flm[27][0])
+                 + (flm[15][0] - flm[28][0])
+                 + (flm[14][0] - flm[29][0])) / 3.0
+        return var_r - var_l
 
     @staticmethod
     def set_process_file_method(log_changes, keep_original):
@@ -735,93 +667,98 @@ class SortProcessor(object):
         if log_changes:
             if keep_original:
                 def process_file(src, dst, changes):
+                    """ Process file method if logging changes
+                        and keeping original """
                     copyfile(src, dst)
                     changes[src] = dst
-                return process_file
+
             else:
                 def process_file(src, dst, changes):
+                    """ Process file method if logging changes
+                        and not keeping original """
                     os.rename(src, dst)
                     changes[src] = dst
-                return process_file
+
         else:
             if keep_original:
-                def process_file(src, dst, changes):
+                def process_file(src, dst, changes):  # pylint: disable=unused-argument
+                    """ Process file method if not logging changes
+                        and keeping original """
                     copyfile(src, dst)
-                return process_file
+
             else:
-                def process_file(src, dst, changes):
+                def process_file(src, dst, changes):  # pylint: disable=unused-argument
+                    """ Process file method if not logging changes
+                        and not keeping original """
                     os.rename(src, dst)
-                return process_file
+        return process_file
 
     @staticmethod
     def set_renaming_method(log_changes):
+        """ Set the method for renaming files """
         if log_changes:
             def renaming(src, output_dir, i, changes):
+                """ Rename files  method if logging changes """
                 src_basename = os.path.basename(src)
 
-                __src = os.path.join (output_dir, '%.5d_%s' % (i, src_basename) )
-                dst = os.path.join (output_dir, '%.5d%s' % (i, os.path.splitext(src_basename)[1] ) )
+                __src = os.path.join(output_dir,
+                                     '{:05d}_{}'.format(i, src_basename))
+                dst = os.path.join(
+                    output_dir,
+                    '{:05d}{}'.format(i, os.path.splitext(src_basename)[1]))
                 changes[src] = dst
                 return __src, dst
-            return renaming
-
         else:
-            def renaming(src, output_dir, i, changes):
+            def renaming(src, output_dir, i, changes):  # pylint: disable=unused-argument
+                """ Rename files method if not logging changes """
                 src_basename = os.path.basename(src)
 
-                src = os.path.join (output_dir, '%.5d_%s' % (i, src_basename) )
-                dst = os.path.join (output_dir, '%.5d%s' % (i, os.path.splitext(src_basename)[1] ) )
+                src = os.path.join(output_dir,
+                                   '{:05d}_{}'.format(i, src_basename))
+                dst = os.path.join(
+                    output_dir,
+                    '{:05d}{}'.format(i, os.path.splitext(src_basename)[1]))
                 return src, dst
-            return renaming
+        return renaming
 
     @staticmethod
     def get_avg_score_hist(img1, references):
+        """ Return the average histogram score between a face and
+            reference image """
         scores = []
         for img2 in references:
             score = cv2.compareHist(img1, img2, cv2.HISTCMP_BHATTACHARYYA)
             scores.append(score)
-        return sum(scores)/len(scores)
-
-    @staticmethod
-    def get_avg_score_faces(f1encs, references):
-        import_face_recognition()
-        scores = []
-        for f2encs in references:
-            score = face_recognition.face_distance(f1encs, f2encs)[0]
-            scores.append(score)
-        return sum(scores)/len(scores)
+        return sum(scores) / len(scores)
 
     @staticmethod
     def get_avg_score_faces_cnn(fl1, references):
+        """ Return the average CNN similarity score
+            between a face and reference image """
         scores = []
         for fl2 in references:
-            score = np.sum ( np.absolute ( (fl2 - fl1).flatten() ) )
+            score = np.sum(np.absolute((fl2 - fl1).flatten()))
             scores.append(score)
-        return sum(scores)/len(scores)
-
-    @staticmethod
-    def write_to_log(log_file, changes):
-        with open(log_file, 'w') as lf:
-            json.dump(changes, lf, sort_keys=True, indent=4)
+        return sum(scores) / len(scores)
 
 
-def bad_args(args):
-    parser.print_help()
-    exit(0)
+def bad_args(args):  # pylint: disable=unused-argument
+    """ Print help on bad arguments """
+    PARSER.print_help()
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-    __warning_string = "Important: face-cnn method will cause an error when "
-    __warning_string += "this tool is called directly instead of through the "
-    __warning_string += "tools.py command script."
-    print (__warning_string)
-    print ("Images sort tool.\n")
-    
-    parser = argparse.ArgumentParser()
-    subparser = parser.add_subparsers()
-    sort = SortProcessor(
-            subparser, "sort", "Sort images using various methods.")
+    __WARNING_STRING = "Important: face-cnn method will cause an error when "
+    __WARNING_STRING += "this tool is called directly instead of through the "
+    __WARNING_STRING += "tools.py command script."
+    print(__WARNING_STRING)
+    print("Images sort tool.\n")
 
-    parser.set_defaults(func=bad_args)
-    arguments = parser.parse_args()
-    arguments.func(arguments)
+    PARSER = FullHelpArgumentParser()
+    SUBPARSER = PARSER.add_subparsers()
+    SORT = cli.SortArgs(
+        SUBPARSER, "sort", "Sort images using various methods.")
+    PARSER.set_defaults(func=bad_args)
+    ARGUMENTS = PARSER.parse_args()
+    ARGUMENTS.func(ARGUMENTS)

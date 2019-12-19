@@ -1,175 +1,285 @@
-import cv2
+#!/usr/bin python3
+""" Main entry point to the extract process of FaceSwap """
 
-from pathlib import Path
-from tqdm import tqdm
+import logging
 import os
-import numpy as np
+import sys
 
-from lib.cli import DirectoryProcessor, rotate_image
+from tqdm import tqdm
+
+from lib.image import encode_image_with_hash, ImagesLoader, ImagesSaver
+from lib.multithreading import MultiThread
 from lib.utils import get_folder
-from lib.multithreading import pool_process
-from lib.detect_blur import is_blurry
-from plugins.PluginLoader import PluginLoader
+from plugins.extract.pipeline import Extractor, ExtractMedia
+from scripts.fsmedia import Alignments, PostProcess, Utils
 
-class ExtractTrainingData(DirectoryProcessor):
-    def create_parser(self, subparser, command, description):
-        self.optional_arguments = self.get_optional_arguments()
-        self.parser = subparser.add_parser(
-            command,
-            help="Extract the faces from a pictures.",
-            description=description,
-            epilog="Questions and feedback: \
-            https://github.com/deepfakes/faceswap-playground"
-            )
+tqdm.monitor_interval = 0  # workaround for TqdmSynchronisationWarning
+logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
-    @staticmethod
-    def get_optional_arguments():
-        ''' Put the arguments in a list so that they are accessible from both argparse and gui '''
-        argument_list = []
-        argument_list.append({ "opts": ('-D', '--detector'),
-                               "type": str,
-                               "choices": ("hog", "cnn", "all"), # case sensitive because this is used to load a plugin.
-                               "default": "hog",
-                               "help": "Detector to use. 'cnn' detects much more angles but will be much more resource intensive and may fail on large files."})
-        argument_list.append({ "opts": ('-l', '--ref_threshold'),
-                               "type": float,
-                               "dest": "ref_threshold",
-                               "default": 0.6,
-                               "help": "Threshold for positive face recognition"})
-        argument_list.append({ "opts": ('-n', '--nfilter'),
-                               "type": str,
-                               "dest": "nfilter",
-                               "nargs": '+',
-                               "default": "nfilter.jpg",
-                               "help": "Reference image for the persons you do not want to process. Should be a front portrait"})
-        argument_list.append({ "opts": ('-f', '--filter'),
-                               "type": str,
-                               "dest": "filter",
-                               "nargs": '+',
-                               "default": "filter.jpg",
-                               "help": "Reference image for the person you want to process. Should be a front portrait"})
-        argument_list.append({ "opts": ('-j', '--processes'),
-                               "type": int,
-                               "default": 1,
-                               "help": "Number of processes to use."})
-        argument_list.append({ "opts": ('-s', '--skip-existing'),
-                               "action": 'store_true',
-                               "dest": 'skip_existing',
-                               "default": False,
-                               "help": "Skips frames already extracted."})
-        argument_list.append({ "opts": ('-dl', '--debug-landmarks'),
-                               "action": "store_true",
-                               "dest": "debug_landmarks",
-                               "default": False,
-                               "help": "Draw landmarks for debug."})
-        argument_list.append({ "opts": ('-r', '--rotate-images'),
-                               "type": str,
-                               "dest": "rotate_images",
-                               "default": None,
-                               "help": "If a face isn't found, rotate the images to try to find a face. Can find more faces at the "
-                                 "cost of extraction speed.  Pass in a single number to use increments of that size up to 360, "
-                                 "or pass in a list of numbers to enumerate exactly what angles to check."})
-        argument_list.append({ "opts": ('-ae', '--align-eyes'),
-                               "action": "store_true",
-                               "dest": "align_eyes",
-                               "default": False,
-                               "help": "Perform extra alignment to ensure left/right eyes lie at the same height"})
-        argument_list.append({ "opts": ('-bt', '--blur-threshold'),
-                               "type": int,
-                               "dest": "blur_thresh",
-                               "default": None,
-                               "help": "Automatically discard images blurrier than the specified threshold. Discarded images are moved into a \"blurry\" sub-folder. Lower values allow more blur"})
-        return argument_list
+
+class Extract():
+    """ The Faceswap Face Extraction Process.
+
+    The extraction process is responsible for detecting faces in a series of images/video, aligning
+    these faces and then generating a mask.
+
+    It leverages a series of user selected plugins, chained together using
+    :mod:`plugins.extract.pipeline`.
+
+    The extract process is self contained and should not be referenced by any other scripts, so it
+    contains no public properties.
+
+    Parameters
+    ----------
+    arguments: argparse.Namespace
+        The arguments to be passed to the extraction process as generated from Faceswap's command
+        line arguments
+    """
+    def __init__(self, arguments):
+        logger.debug("Initializing %s: (args: %s", self.__class__.__name__, arguments)
+        self._args = arguments
+
+        self._output_dir = str(get_folder(self._args.output_dir))
+
+        logger.info("Output Directory: %s", self._args.output_dir)
+        self._images = ImagesLoader(self._args.input_dir, load_with_hash=False, fast_count=True)
+        self._alignments = Alignments(self._args, True, self._images.is_video)
+
+        self._existing_count = 0
+        self._set_skip_list()
+
+        self._post_process = PostProcess(arguments)
+        configfile = self._args.configfile if hasattr(self._args, "configfile") else None
+        normalization = None if self._args.normalization == "none" else self._args.normalization
+        self._extractor = Extractor(self._args.detector,
+                                    self._args.aligner,
+                                    self._args.masker,
+                                    configfile=configfile,
+                                    multiprocess=not self._args.singleprocess,
+                                    rotate_images=self._args.rotate_images,
+                                    min_size=self._args.min_size,
+                                    normalize_method=normalization)
+        self._threads = list()
+        self._verify_output = False
+        logger.debug("Initialized %s", self.__class__.__name__)
+
+    @property
+    def _save_interval(self):
+        """ int: The number of frames to be processed between each saving of the alignments file if
+        it has been provided, otherwise ``None`` """
+        if hasattr(self._args, "save_interval"):
+            return self._args.save_interval
+        return None
+
+    @property
+    def _skip_num(self):
+        """ int: Number of frames to skip if extract_every_n has been provided """
+        return self._args.extract_every_n if hasattr(self._args, "extract_every_n") else 1
+
+    def _set_skip_list(self):
+        """ Add the skip list to the image loader
+
+        Checks against `extract_every_n` and the existence of alignments data (can exist if
+        `skip_existing` or `skip_existing_faces` has been provided) and compiles a list of frame
+        indices that should not be processed, providing these to :class:`lib.image.ImagesLoader`.
+        """
+        if self._skip_num == 1 and not self._alignments.data:
+            logger.debug("No frames to be skipped")
+            return
+        skip_list = []
+        for idx, filename in enumerate(self._images.file_list):
+            if idx % self._skip_num != 0:
+                logger.trace("Adding image '%s' to skip list due to extract_every_n = %s",
+                             filename, self._skip_num)
+                skip_list.append(idx)
+            # Items may be in the alignments file if skip-existing[-faces] is selected
+            elif os.path.basename(filename) in self._alignments.data:
+                self._existing_count += 1
+                logger.trace("Removing image: '%s' due to previously existing", filename)
+                skip_list.append(idx)
+        if self._existing_count != 0:
+            logger.info("Skipping %s frames due to skip_existing/skip_existing_faces.",
+                        self._existing_count)
+        logger.debug("Adding skip list: %s", skip_list)
+        self._images.add_skip_list(skip_list)
 
     def process(self):
-        extractor_name = "Align" # TODO Pass as argument
-        self.extractor = PluginLoader.get_extractor(extractor_name)()
-        processes = self.arguments.processes
-        try:
-            if processes != 1:
-                files = list(self.read_directory())
-                for filename, faces in tqdm(pool_process(self.processFiles, files, processes=processes), total = len(files)):
-                    self.num_faces_detected += 1
-                    self.faces_detected[os.path.basename(filename)] = faces
-            else:
-                for filename in tqdm(self.read_directory()):
-                    try:
-                        image = cv2.imread(filename)
-                        self.faces_detected[os.path.basename(filename)] = self.handleImage(image, filename)
-                    except Exception as e:
-                        if self.arguments.verbose:
-                            print('Failed to extract from image: {}. Reason: {}'.format(filename, e))
-                        pass
-        finally:
-            self.write_alignments()
+        """ The entry point for triggering the Extraction Process.
 
-    def processFiles(self, filename):
-        try:
-            image = cv2.imread(filename)
-            return filename, self.handleImage(image, filename)
-        except Exception as e:
-            if self.arguments.verbose:
-                print('Failed to extract from image: {}. Reason: {}'.format(filename, e))
-            pass
-        return filename, []
+        Should only be called from  :class:`lib.cli.ScriptExecutor`
+        """
+        logger.info('Starting, this may take a while...')
+        # from lib.queue_manager import queue_manager ; queue_manager.debug_monitor(3)
+        self._threaded_redirector("load")
+        self._run_extraction()
+        for thread in self._threads:
+            thread.join()
+        self._alignments.save()
+        Utils.finalize(self._images.process_count + self._existing_count,
+                       self._alignments.faces_count,
+                       self._verify_output)
 
-    def getRotatedImageFaces(self, image, angle):
-        rotated_image = rotate_image(image, angle)
-        faces = self.get_faces(rotated_image, rotation=angle)
-        rotated_faces = [(idx, face) for idx, face in faces]
-        return rotated_faces, rotated_image
+    def _threaded_redirector(self, task, io_args=None):
+        """ Redirect image input/output tasks to relevant queues in background thread
 
-    def imageRotator(self, image):
-        ''' rotates the image through rotation_angles to try to find a face '''
-        for angle in self.rotation_angles:
-            rotated_faces, rotated_image = self.getRotatedImageFaces(image, angle)
-            if len(rotated_faces) > 0:
-                if self.arguments.verbose:
-                    print('found face(s) by rotating image {} degrees'.format(angle))
+        Parameters
+        ----------
+        task: str
+            The name of the task to be put into a background thread
+        io_args: tuple, optional
+            Any arguments that need to be provided to the background function
+        """
+        logger.debug("Threading task: (Task: '%s')", task)
+        io_args = tuple() if io_args is None else (io_args, )
+        func = getattr(self, "_{}".format(task))
+        io_thread = MultiThread(func, *io_args, thread_count=1)
+        io_thread.start()
+        self._threads.append(io_thread)
+
+    def _load(self):
+        """ Load the images
+
+        Loads images from :class:`lib.image.ImagesLoader`, formats them into a dict compatible
+        with :class:`plugins.extract.Pipeline.Extractor` and passes them into the extraction queue.
+        """
+        logger.debug("Load Images: Start")
+        load_queue = self._extractor.input_queue
+        for filename, image in self._images.load():
+            if load_queue.shutdown.is_set():
+                logger.debug("Load Queue: Stop signal received. Terminating")
                 break
-        return rotated_faces, rotated_image
+            item = ExtractMedia(filename, image[..., :3])
+            load_queue.put(item)
+        load_queue.put("EOF")
+        logger.debug("Load Images: Complete")
 
-    def handleImage(self, image, filename):
-        faces = self.get_faces(image)
-        process_faces = [(idx, face) for idx, face in faces]
+    def _reload(self, detected_faces):
+        """ Reload the images and pair to detected face
 
-        # Run image rotator if requested and no faces found
-        if self.rotation_angles is not None and len(process_faces) == 0:
-            process_faces, image = self.imageRotator(image)
+        When the extraction pipeline is running in serial mode, images are reloaded from disk,
+        paired with their extraction data and passed back into the extraction queue
 
-        rvals = []
-        for idx, face in process_faces:
-            # Draws landmarks for debug
-            if self.arguments.debug_landmarks:
-                for (x, y) in face.landmarksAsXY():
-                    cv2.circle(image, (x, y), 2, (0, 0, 255), -1)
+        Parameters
+        ----------
+        detected_faces: dict
+            Dictionary of :class:`plugins.extract.pipeline.ExtractMedia` with the filename as the
+            key for repopulating the image attribute.
+        """
+        logger.debug("Reload Images: Start. Detected Faces Count: %s", len(detected_faces))
+        load_queue = self._extractor.input_queue
+        for filename, image in self._images.load():
+            if load_queue.shutdown.is_set():
+                logger.debug("Reload Queue: Stop signal received. Terminating")
+                break
+            logger.trace("Reloading image: '%s'", filename)
+            extract_media = detected_faces.pop(filename, None)
+            if not extract_media:
+                logger.warning("Couldn't find faces for: %s", filename)
+                continue
+            extract_media.set_image(image)
+            load_queue.put(extract_media)
+        load_queue.put("EOF")
+        logger.debug("Reload Images: Complete")
 
-            resized_image, t_mat = self.extractor.extract(image, face, 256, self.arguments.align_eyes)
-            output_file = get_folder(self.output_dir) / Path(filename).stem
+    def _run_extraction(self):
+        """ The main Faceswap Extraction process
 
-            # Detect blurry images
-            if self.arguments.blur_thresh is not None:
-                aligned_landmarks = self.extractor.transform_points(face.landmarksAsXY(), t_mat, 256, 48)
-                feature_mask = self.extractor.get_feature_mask(aligned_landmarks / 256, 256, 48)
-                feature_mask = cv2.blur(feature_mask, (10, 10))
-                isolated_face = cv2.multiply(feature_mask, resized_image.astype(float)).astype(np.uint8)
-                blurry, focus_measure = is_blurry(isolated_face, self.arguments.blur_thresh)
-                # print("{} focus measure: {}".format(Path(filename).stem, focus_measure))
-                # cv2.imshow("Isolated Face", isolated_face)
-                # cv2.waitKey(0)
-                # cv2.destroyAllWindows()
-                if blurry:
-                    print("{}'s focus measure of {} was below the blur threshold, moving to \"blurry\"".format(Path(filename).stem, focus_measure))
-                    output_file = get_folder(Path(self.output_dir) / Path("blurry")) / Path(filename).stem
+        Receives items from :class:`plugins.extract.Pipeline.Extractor` and either saves out the
+        faces and data (if on the final pass) or reprocesses data through the pipeline for serial
+        processing.
+        """
+        size = self._args.size if hasattr(self._args, "size") else 256
+        saver = ImagesSaver(self._output_dir, as_bytes=True)
+        exception = False
+        phase_desc = "Extraction"
 
-            cv2.imwrite('{}_{}{}'.format(str(output_file), str(idx), Path(filename).suffix), resized_image)
-            f = {
-                "r": face.r,
-                "x": face.x,
-                "w": face.w,
-                "y": face.y,
-                "h": face.h,
-                "landmarksXY": face.landmarksAsXY()
-            }
-            rvals.append(f)
-        return rvals
+        for phase in range(self._extractor.passes):
+            if exception:
+                break
+            is_final = self._extractor.final_pass
+            detected_faces = dict()
+            self._extractor.launch()
+            self._check_thread_error()
+            if self._args.singleprocess:
+                phase_desc = self._extractor.phase.title()
+            desc = "Running pass {} of {}: {}".format(phase + 1,
+                                                      self._extractor.passes,
+                                                      phase_desc)
+            status_bar = tqdm(self._extractor.detected_faces(),
+                              total=self._images.process_count,
+                              file=sys.stdout,
+                              desc=desc)
+            for idx, extract_media in enumerate(status_bar):
+                self._check_thread_error()
+                if is_final:
+                    self._output_processing(extract_media, size)
+                    self._output_faces(saver, extract_media)
+                    if self._save_interval and (idx + 1) % self._save_interval == 0:
+                        self._alignments.save()
+                else:
+                    extract_media.remove_image()
+                    # cache extract_media for next run
+                    detected_faces[extract_media.filename] = extract_media
+                status_bar.update(1)
+
+            if not is_final:
+                logger.debug("Reloading images")
+                self._threaded_redirector("reload", detected_faces)
+        saver.close()
+
+    def _check_thread_error(self):
+        """ Check if any errors have occurred in the running threads and their errors """
+        for thread in self._threads:
+            thread.check_and_raise_error()
+
+    def _output_processing(self, extract_media, size):
+        """ Prepare faces for output
+
+        Loads the aligned face, perform any processing actions and verify the output.
+
+        Parameters
+        ----------
+        extract_media: :class:`plugins.extract.pipeline.ExtractMedia`
+            Output from :class:`plugins.extract.pipeline.Extractor`
+        size: int
+            The size that the aligned face should be created at
+        """
+        for face in extract_media.detected_faces:
+            face.load_aligned(extract_media.image, size=size)
+
+        self._post_process.do_actions(extract_media)
+        extract_media.remove_image()
+
+        faces_count = len(extract_media.detected_faces)
+        if faces_count == 0:
+            logger.verbose("No faces were detected in image: %s",
+                           os.path.basename(extract_media.filename))
+
+        if not self._verify_output and faces_count > 1:
+            self._verify_output = True
+
+    def _output_faces(self, saver, extract_media):
+        """ Output faces to save thread
+
+        Set the face filename based on the frame name and put the face to the
+        :class:`~lib.image.ImagesSaver` save queue and add the face information to the alignments
+        data.
+
+        Parameters
+        ----------
+        saver: lib.images.ImagesSaver
+            The background saver for saving the image
+        extract_media: :class:`~plugins.extract.pipeline.ExtractMedia`
+            The output from :class:`~plugins.extract.Pipeline.Extractor`
+        """
+        logger.trace("Outputting faces for %s", extract_media.filename)
+        final_faces = list()
+        filename, extension = os.path.splitext(os.path.basename(extract_media.filename))
+        for idx, face in enumerate(extract_media.detected_faces):
+            output_filename = "{}_{}{}".format(filename, str(idx), extension)
+            face.hash, image = encode_image_with_hash(face.aligned_face, extension)
+
+            saver.save(output_filename, image)
+            final_faces.append(face.to_alignment())
+        self._alignments.data[os.path.basename(extract_media.filename)] = final_faces
+        del extract_media
